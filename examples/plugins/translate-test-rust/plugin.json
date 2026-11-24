@@ -1,0 +1,10 @@
+{
+  "id": "deskbox.translate-test",
+  "name": "Translate Test",
+  "version": "1.0.0",
+  "protocol_version": 1,
+  "entry": "tr.exe",
+  "keywords": ["tr"],
+  "debounce_ms": 200,
+  "timeout_ms": 1500
+}

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using DeskBox.Models;
+using DeskBox.Plugins;
 
 namespace DeskBox.ViewModels;
 
@@ -17,6 +18,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     private readonly Services.SearchHistoryService _historyService;
     private readonly Services.FileMetaService _fileMetaService;
     private readonly Services.SearchRecommendationLayoutService _recommendationLayoutService;
+    private readonly PluginCommandRouter _pluginCommandRouter = new();
     private readonly SynchronizationContext? _uiContext;
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _resultRefreshCts;
@@ -1143,6 +1145,12 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     /// </summary>
     private async Task SearchAsync(string query, SearchRefreshKind refreshKind)
     {
+        bool isPluginQuery = _pluginCommandRouter.TryRoute(query, out PluginRoute route);
+        if (isPluginQuery && refreshKind is SearchRefreshKind.ProviderUpdate or SearchRefreshKind.LoadMore)
+        {
+            return;
+        }
+
         CancelCurrentSearch();
         long generation = Interlocked.Increment(ref _searchGeneration);
 
@@ -1220,11 +1228,13 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 SearchRefreshKind.LoadMore => Services.SearchEngineService.FileResultPageSize,
                 _ => Services.SearchEngineService.InitialFileResultPageSize
             };
-            SearchResponse response = await _searchEngine.SearchPageAsync(
-                query,
-                fileResultOffset,
-                fileResultPageSize,
-                token);
+            SearchResponse response = isPluginQuery
+                ? CreateFakePluginResponse(query, route)
+                : await _searchEngine.SearchPageAsync(
+                    query,
+                    fileResultOffset,
+                    fileResultPageSize,
+                    token);
             if (token.IsCancellationRequested ||
                 generation != Volatile.Read(ref _searchGeneration))
             {
@@ -1232,6 +1242,16 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
             }
 
             ApplySearchResponse(response, token, refreshKind);
+
+            if (isPluginQuery && refreshKind == SearchRefreshKind.UserQuery)
+            {
+                SearchTabItem? allTab = Tabs.FirstOrDefault(
+                    tab => tab.Id == SearchSettingsSlice.CategoryAll);
+                if (allTab is not null && !ReferenceEquals(SelectedTab, allTab))
+                {
+                    SelectedTab = allTab;
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1249,6 +1269,61 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 IsSearching = false;
             }
         }
+    }
+
+    private static SearchResponse CreateFakePluginResponse(string query, PluginRoute route)
+    {
+        if (!string.Equals(route.PluginId, "test.timestamp", StringComparison.Ordinal))
+        {
+            return new SearchResponse
+            {
+                Query = query,
+                Groups = [],
+                RankedItems = [],
+                TotalResultCount = 0,
+                IsComplete = true,
+                FileProviderState = EverythingConnectionState.Connected
+            };
+        }
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        long seconds = now.ToUnixTimeSeconds();
+        long milliseconds = now.ToUnixTimeMilliseconds();
+
+        return new SearchResponse
+        {
+            Query = query,
+            RankedItems =
+            [
+                new SearchResultItem
+                {
+                    Kind = SearchResultKind.Action,
+                    Title = seconds.ToString(),
+                    Subtitle = "Unix seconds",
+                    ActionId = $"copy-calc:{seconds}",
+                    Glyph = "\uE8EF",
+                    RelevanceScore = 12000
+                },
+                new SearchResultItem
+                {
+                    Kind = SearchResultKind.Action,
+                    Title = milliseconds.ToString(),
+                    Subtitle = "Unix milliseconds",
+                    ActionId = $"copy-calc:{milliseconds}",
+                    Glyph = "\uE8EF",
+                    RelevanceScore = 11900
+                }
+            ],
+            Groups = [],
+            TotalResultCount = 2,
+            MaterializedFileResultCount = 0,
+            TotalFileResultCount = 0,
+            NextFileResultOffset = 0,
+            HasMoreResults = false,
+            Elapsed = TimeSpan.Zero,
+            IsComplete = true,
+            FileProviderState = EverythingConnectionState.Connected
+        };
     }
 
     public async Task LoadMoreResultsAsync()

@@ -7534,6 +7534,9 @@ public partial class App : Application
                     _clipboardHotkeyService = null;
                 }
             }),
+            ShutdownStep.Bounded("plugin-runtime", () =>
+                DeskBox.Plugins.PluginRuntimeManager.DisposeSharedAsync(),
+                TimeSpan.FromSeconds(2)),
             ShutdownStep.Bounded("search-settings", () =>
                 _searchSettings?.StopAsync() ?? Task.CompletedTask,
                 shutdownGrace, abortFollowingStepsOnTimeout: true),

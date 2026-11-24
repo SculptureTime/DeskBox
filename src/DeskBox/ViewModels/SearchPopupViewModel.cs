@@ -18,7 +18,8 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     private readonly Services.SearchHistoryService _historyService;
     private readonly Services.FileMetaService _fileMetaService;
     private readonly Services.SearchRecommendationLayoutService _recommendationLayoutService;
-    private readonly PluginCommandRouter _pluginCommandRouter = new();
+    private readonly PluginRuntimeManager _pluginRuntimeManager;
+    private readonly PluginCommandRouter _pluginCommandRouter;
     private readonly SynchronizationContext? _uiContext;
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _resultRefreshCts;
@@ -28,6 +29,8 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     private readonly Dictionary<SearchResultItem, Task> _metadataTasks =
         new(ReferenceEqualityComparer.Instance);
     private long _searchGeneration;
+    private static long s_pluginActionBatchSeed;
+    private long _pluginActionBatchId;
     private bool _isDisposed;
     private int _nextFileResultOffset;
     private int _loadMoreRunning;
@@ -78,6 +81,8 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
         _fileMetaService = fileMetaService;
         _recommendationLayoutService = recommendationLayoutService
             ?? new Services.SearchRecommendationLayoutService();
+        _pluginRuntimeManager = PluginRuntimeManager.Shared;
+        _pluginCommandRouter = _pluginRuntimeManager.Router;
         _uiContext = SynchronizationContext.Current;
         _searchEngine.ResultsChanged += OnResultsChanged;
         _searchEngine.EverythingProvider.ConnectionChanged += OnEverythingConnectionChanged;
@@ -1151,6 +1156,11 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (refreshKind == SearchRefreshKind.UserQuery)
+        {
+            BeginPluginActionBatch();
+        }
+
         CancelCurrentSearch();
         long generation = Interlocked.Increment(ref _searchGeneration);
 
@@ -1228,13 +1238,38 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 SearchRefreshKind.LoadMore => Services.SearchEngineService.FileResultPageSize,
                 _ => Services.SearchEngineService.InitialFileResultPageSize
             };
-            SearchResponse response = isPluginQuery
-                ? CreateFakePluginResponse(query, route)
-                : await _searchEngine.SearchPageAsync(
+            SearchResponse response;
+            if (isPluginQuery)
+            {
+                if (route.DebounceMs > 0)
+                {
+                    await Task.Delay(route.DebounceMs, token);
+                }
+
+                try
+                {
+                    PluginResponse pluginResponse =
+                        await _pluginRuntimeManager.QueryAsync(route, token);
+                    response = CreatePluginSearchResponse(query, route, pluginResponse);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[Plugins] Query for '{route.PluginId}' failed: {ex.Message}");
+                    response = CreatePluginErrorResponse(query, route, ex.Message);
+                }
+            }
+            else
+            {
+                response = await _searchEngine.SearchPageAsync(
                     query,
                     fileResultOffset,
                     fileResultPageSize,
                     token);
+            }
             if (token.IsCancellationRequested ||
                 generation != Volatile.Read(ref _searchGeneration))
             {
@@ -1271,51 +1306,53 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static SearchResponse CreateFakePluginResponse(string query, PluginRoute route)
+    private SearchResponse CreatePluginSearchResponse(
+        string query,
+        PluginRoute route,
+        PluginResponse pluginResponse)
     {
-        if (!string.Equals(route.PluginId, "test.timestamp", StringComparison.Ordinal))
+        if (!string.IsNullOrWhiteSpace(pluginResponse.Error))
         {
-            return new SearchResponse
-            {
-                Query = query,
-                Groups = [],
-                RankedItems = [],
-                TotalResultCount = 0,
-                IsComplete = true,
-                FileProviderState = EverythingConnectionState.Connected
-            };
+            return CreatePluginErrorResponse(query, route, pluginResponse.Error);
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-        long seconds = now.ToUnixTimeSeconds();
-        long milliseconds = now.ToUnixTimeMilliseconds();
+        var items = new List<SearchResultItem>();
+        IReadOnlyList<PluginResult> pluginResults = pluginResponse.Results ?? [];
+        int resultCount = Math.Min(pluginResults.Count, 50);
+        for (int i = 0; i < resultCount; i++)
+        {
+            PluginResult result = pluginResults[i];
+            string title = TruncateText(result.Title, 256);
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                continue;
+            }
+
+            string? actionId = _pluginRuntimeManager.RegisterAction(
+                _pluginActionBatchId,
+                route.PluginId,
+                result.Id,
+                result.Action);
+
+            items.Add(new SearchResultItem
+            {
+                Kind = SearchResultKind.Action,
+                Title = title,
+                Subtitle = string.IsNullOrWhiteSpace(result.Subtitle)
+                    ? null
+                    : TruncateText(result.Subtitle, 512),
+                ActionId = actionId,
+                Glyph = "\uE8A5",
+                RelevanceScore = 12000 - i
+            });
+        }
 
         return new SearchResponse
         {
             Query = query,
-            RankedItems =
-            [
-                new SearchResultItem
-                {
-                    Kind = SearchResultKind.Action,
-                    Title = seconds.ToString(),
-                    Subtitle = "Unix seconds",
-                    ActionId = $"copy-calc:{seconds}",
-                    Glyph = "\uE8EF",
-                    RelevanceScore = 12000
-                },
-                new SearchResultItem
-                {
-                    Kind = SearchResultKind.Action,
-                    Title = milliseconds.ToString(),
-                    Subtitle = "Unix milliseconds",
-                    ActionId = $"copy-calc:{milliseconds}",
-                    Glyph = "\uE8EF",
-                    RelevanceScore = 11900
-                }
-            ],
+            RankedItems = items,
             Groups = [],
-            TotalResultCount = 2,
+            TotalResultCount = items.Count,
             MaterializedFileResultCount = 0,
             TotalFileResultCount = 0,
             NextFileResultOffset = 0,
@@ -1324,6 +1361,52 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
             IsComplete = true,
             FileProviderState = EverythingConnectionState.Connected
         };
+    }
+
+    private static SearchResponse CreatePluginErrorResponse(
+        string query,
+        PluginRoute route,
+        string error)
+    {
+        string detail = TruncateText(error, 300);
+        return new SearchResponse
+        {
+            Query = query,
+            RankedItems =
+            [
+                new SearchResultItem
+                {
+                    Kind = SearchResultKind.Action,
+                    Title = $"{route.PluginId} unavailable",
+                    Subtitle = detail,
+                    ActionId = null,
+                    Glyph = "\uEA39",
+                    RelevanceScore = 12000
+                }
+            ],
+            Groups = [],
+            TotalResultCount = 1,
+            HasMoreResults = false,
+            Elapsed = TimeSpan.Zero,
+            IsComplete = true,
+            FileProviderState = EverythingConnectionState.Connected
+        };
+    }
+
+    private void BeginPluginActionBatch()
+    {
+        ClearPluginActionBatch();
+        _pluginActionBatchId = Interlocked.Increment(ref s_pluginActionBatchSeed);
+    }
+
+    private void ClearPluginActionBatch()
+    {
+        long batchId = _pluginActionBatchId;
+        _pluginActionBatchId = 0;
+        if (batchId > 0)
+        {
+            _pluginRuntimeManager.ClearActionBatch(batchId);
+        }
     }
 
     public async Task LoadMoreResultsAsync()
@@ -2178,6 +2261,26 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 break;
 
             case SearchResultKind.Action:
+                if (string.IsNullOrWhiteSpace(item.ActionId))
+                {
+                    return false;
+                }
+
+                bool keepPluginPopupOpen = false;
+                string deferredActionId = item.ActionId;
+                if (PluginRuntimeManager.IsActionHandle(item.ActionId))
+                {
+                    if (!_pluginRuntimeManager.TryStageAction(
+                            item.ActionId,
+                            out PluginBoundAction pluginAction,
+                            out deferredActionId))
+                    {
+                        return false;
+                    }
+
+                    keepPluginPopupOpen = pluginAction.KeepOpen;
+                }
+
                 CommitExecution(item, recordResult: false);
                 // Actions open windows (settings / todo / quick capture) —
                 // same callback-isolation rule as the File/Folder branches
@@ -2186,14 +2289,14 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 {
                     try
                     {
-                        ExecuteAction(item.ActionId);
+                        ExecuteAction(deferredActionId);
                     }
                     catch (Exception ex)
                     {
                         App.Log($"[SearchPopup] Deferred action failed: {ex.Message}");
                     }
                 });
-                return true;
+                return !keepPluginPopupOpen;
 
             case SearchResultKind.Todo:
                 CommitExecution(item);
@@ -2300,6 +2403,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     /// </summary>
     public void ClearSearch()
     {
+        ClearPluginActionBatch();
         Interlocked.Increment(ref _searchGeneration);
         CancelCurrentSearch();
         bool previousBatch = IsBatchUpdatingResults;
@@ -2349,6 +2453,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
     /// </summary>
     public void OnPopupHidden()
     {
+        ClearPluginActionBatch();
         Interlocked.Increment(ref _searchGeneration);
         CancelCurrentSearch();
         _resultRefreshCts?.Cancel();
@@ -2400,6 +2505,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
             return 0;
         }
 
+        ClearPluginActionBatch();
         CancelCurrentSearch();
         _resultRefreshCts?.Cancel();
         _recommendationCts?.Cancel();
@@ -2525,7 +2631,8 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 break;
             default:
                 if (!string.IsNullOrWhiteSpace(actionId) &&
-                    (actionId.StartsWith("quick-note:", StringComparison.Ordinal) ||
+                    (PluginRuntimeManager.IsActionHandle(actionId) ||
+                     actionId.StartsWith("quick-note:", StringComparison.Ordinal) ||
                      actionId.StartsWith("quick-todo:", StringComparison.Ordinal) ||
                      actionId.StartsWith("quick-note-open:", StringComparison.Ordinal) ||
                      actionId.StartsWith("quick-todo-open:", StringComparison.Ordinal) ||
@@ -2607,6 +2714,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
         }
 
         _isDisposed = true;
+        ClearPluginActionBatch();
         _searchEngine.ResultsChanged -= OnResultsChanged;
         _searchEngine.EverythingProvider.ConnectionChanged -= OnEverythingConnectionChanged;
         _settingsService.SettingsChanged -= OnSettingsChanged;

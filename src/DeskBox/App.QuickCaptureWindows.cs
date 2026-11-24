@@ -1,5 +1,6 @@
 using DeskBox.Models;
 using DeskBox.Platform;
+using DeskBox.Plugins;
 using DeskBox.Services;
 using DeskBox.Views;
 
@@ -85,6 +86,16 @@ public partial class App
         if (string.Equals(actionId, "quick-jot", StringComparison.Ordinal))
         {
             ShowQuickJotWindow();
+            return;
+        }
+
+        if (PluginRuntimeManager.IsActionHandle(actionId))
+        {
+            PluginRuntimeManager runtime = PluginRuntimeManager.Shared;
+            if (runtime.TryTakeStagedAction(actionId, out PluginBoundAction pluginAction))
+            {
+                await ExecutePluginSearchActionAsync(runtime, pluginAction);
+            }
             return;
         }
 
@@ -184,6 +195,78 @@ public partial class App
             {
                 await QuickCreateNoteFromSearchAsync(body, openAfterSave: false);
             }
+        }
+    }
+
+    private static async Task ExecutePluginSearchActionAsync(
+        PluginRuntimeManager runtime,
+        PluginBoundAction action)
+    {
+        try
+        {
+            await UiDispatch.RunAsync(async () =>
+            {
+                switch (action.Type)
+                {
+                    case "copy":
+                        if (action.Value is not null)
+                        {
+                            CopyPlainTextToSystemClipboard(action.Value);
+                        }
+                        break;
+
+                    case "open_url":
+                        if (action.Value is not null &&
+                            Uri.TryCreate(action.Value, UriKind.Absolute, out Uri? uri) &&
+                            (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            SearchWebAndUrlEvaluator.TryLaunchSafeExternalUri(uri.AbsoluteUri);
+                        }
+                        else
+                        {
+                            Log("[Plugins] Rejected plugin open_url action with non-http(s) URI.");
+                        }
+                        break;
+
+                    case "open_path":
+                        if (!string.IsNullOrWhiteSpace(action.Value) &&
+                            Path.IsPathFullyQualified(action.Value))
+                        {
+                            string fullPath = Path.GetFullPath(action.Value);
+                            if (File.Exists(fullPath) || Directory.Exists(fullPath))
+                            {
+                                await ShellLaunchService.OpenPathAsync(fullPath, IntPtr.Zero);
+                            }
+                            else
+                            {
+                                Log($"[Plugins] Rejected plugin open_path action for missing path '{fullPath}'.");
+                            }
+                        }
+                        else
+                        {
+                            Log("[Plugins] Rejected plugin open_path action with a non-absolute path.");
+                        }
+                        break;
+
+                    case "plugin":
+                        if (!string.IsNullOrWhiteSpace(action.ExecuteId))
+                        {
+                            await runtime.ExecuteAsync(
+                                action.PluginId,
+                                action.ExecuteId,
+                                CancellationToken.None);
+                        }
+                        break;
+                }
+            });
+        }
+        catch (OperationCanceledException) when (IsShuttingDown)
+        {
+        }
+        catch (Exception ex)
+        {
+            Log($"[Plugins] Search action failed for '{action.PluginId}': {ex.Message}");
         }
     }
 

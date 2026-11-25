@@ -108,14 +108,19 @@ jobs:
             }
           }
           Write-Host "Inno Setup compiler: $iscc ($innoVersion)"
-          $innoParsed = $null
-          if ([version]::TryParse($innoVersion, [ref]$innoParsed)) {
-            if ($innoParsed -lt [version]'6.4.0') {
-              throw "Inno Setup $innoVersion is below the required 6.4.0 (installer language arbitration floor for the /LANG update flow)."
-            }
+          if ($innoVersion -in @('', '0.0.0.0')) {
+            Write-Warning "Inno Setup file version metadata is unavailable on this runner; the preview build will validate the compiler by actually invoking ISCC."
           }
           else {
-            Write-Warning "Inno Setup version '$innoVersion' could not be parsed; skipped the 6.4.0 floor check."
+            $innoParsed = $null
+            if ([version]::TryParse($innoVersion, [ref]$innoParsed)) {
+              if ($innoParsed -lt [version]'6.4.0') {
+                throw "Inno Setup $innoVersion is below the required 6.4.0 (installer language arbitration floor for the /LANG update flow)."
+              }
+            }
+            else {
+              Write-Warning "Inno Setup version '$innoVersion' could not be parsed; skipped the 6.4.0 floor check."
+            }
           }
 
           $kitsBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'

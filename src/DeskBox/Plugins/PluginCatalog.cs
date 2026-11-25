@@ -97,7 +97,8 @@ internal sealed class PluginCatalog
                     continue;
                 }
 
-                if (!TryBuildDescriptor(directory, manifest, out PluginDescriptor? candidate))
+                if (!TryBuildDescriptor(directory, manifest, out PluginDescriptor? candidate) ||
+                    candidate is null)
                 {
                     continue;
                 }

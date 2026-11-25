@@ -1322,7 +1322,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
         for (int i = 0; i < resultCount; i++)
         {
             PluginResult result = pluginResults[i];
-            string title = TruncateText(result.Title, 256);
+            string title = TruncatePluginText(result.Title, 256);
             if (string.IsNullOrWhiteSpace(title))
             {
                 continue;
@@ -1340,7 +1340,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
                 Title = title,
                 Subtitle = string.IsNullOrWhiteSpace(result.Subtitle)
                     ? null
-                    : TruncateText(result.Subtitle, 512),
+                    : TruncatePluginText(result.Subtitle, 512),
                 ActionId = actionId,
                 Glyph = "\uE8A5",
                 RelevanceScore = 12000 - i
@@ -1368,7 +1368,7 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
         PluginRoute route,
         string error)
     {
-        string detail = TruncateText(error, 300);
+        string detail = TruncatePluginText(error, 300);
         return new SearchResponse
         {
             Query = query,
@@ -1391,6 +1391,12 @@ public sealed partial class SearchPopupViewModel : ObservableObject, IDisposable
             IsComplete = true,
             FileProviderState = EverythingConnectionState.Connected
         };
+    }
+
+    private static string TruncatePluginText(string? value, int maxLength)
+    {
+        string text = value ?? string.Empty;
+        return text.Length <= maxLength ? text : text[..maxLength];
     }
 
     private void BeginPluginActionBatch()

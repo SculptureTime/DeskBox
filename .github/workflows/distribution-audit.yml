@@ -83,9 +83,9 @@ jobs:
           }
 
           $iscc = @(
-            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
             Select-Object -First 1
           if (-not $iscc) {

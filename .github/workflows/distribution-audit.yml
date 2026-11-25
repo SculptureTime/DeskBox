@@ -1,9 +1,6 @@
 name: Native AOT Distribution Gate
 
 on:
-  push:
-    branches:
-      - feature/plugin-runtime-v1
   workflow_dispatch:
     inputs:
       verify-authenticode:

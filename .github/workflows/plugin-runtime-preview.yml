@@ -1,0 +1,107 @@
+name: Plugin Runtime x64 Preview
+
+on:
+  push:
+    branches:
+      - feature/plugin-runtime-v1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-runtime-x64-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build x64 installer and reference plugins
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.404
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          dotnet --version
+          rustc -vV
+          cargo --version
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "Inno Setup compiler not found at '$iscc'."
+          }
+          Write-Host "ISCC=$iscc"
+
+      - name: Publish DeskBox x64 Native AOT
+        shell: pwsh
+        run: .\scripts\publish-aot-retail.ps1 -Platform x64
+
+      - name: Compile x64 installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            /DDeskBoxNativeAot=1 `
+            /DDeskBoxBundledRuntime=1 `
+            /DMyAppReleaseDir=..\.artifacts\aot-retail\win-x64\publish `
+            .\installer\DeskBox.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build reference plugins
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path .\examples\plugins\timestamp-rust\Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "timestamp plugin build failed." }
+          cargo build --release --manifest-path .\examples\plugins\translate-test-rust\Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "translate-test plugin build failed." }
+
+          $root = ".\.artifacts\plugin-preview"
+          $ts = Join-Path $root "plugins\ts"
+          $tr = Join-Path $root "plugins\tr"
+          New-Item -ItemType Directory -Force $ts, $tr | Out-Null
+          Copy-Item .\examples\plugins\timestamp-rust\target\release\ts.exe $ts
+          Copy-Item .\examples\plugins\timestamp-rust\plugin.json $ts
+          Copy-Item .\examples\plugins\translate-test-rust\target\release\tr.exe $tr
+          Copy-Item .\examples\plugins\translate-test-rust\plugin.json $tr
+
+      - name: Stage preview package
+        shell: pwsh
+        run: |
+          $root = ".\.artifacts\plugin-preview"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $installer = Get-ChildItem -Path .\Output -Filter "DeskBox_Setup_*_x64.exe" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $installer) { throw "x64 DeskBox installer was not produced." }
+          Copy-Item $installer.FullName (Join-Path $root $installer.Name)
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -LiteralPath (Join-Path $root "$($installer.Name).sha256") -Encoding ascii
+          $installText = @(
+            "DeskBox plugin runtime preview",
+            "",
+            "1. Install $($installer.Name)",
+            "2. Copy plugins\ts to %LOCALAPPDATA%\DeskBox\Plugins\ts",
+            "3. Copy plugins\tr to %LOCALAPPDATA%\DeskBox\Plugins\tr",
+            "4. Restart DeskBox",
+            "5. Press Alt+D and test: ts, ts 1790000000, tr hello"
+          )
+          $installText | Set-Content -LiteralPath (Join-Path $root "INSTALL.txt") -Encoding utf8
+
+      - name: Upload x64 preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskbox-plugin-runtime-x64-preview
+          path: .artifacts/plugin-preview/**
+          if-no-files-found: error
+          retention-days: 14
